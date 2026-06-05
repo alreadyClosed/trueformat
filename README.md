@@ -1,3 +1,5 @@
+# TOOL IS STILL IN TESTING PHASE
+
 # trueformat
 
 **trueformat** is a Linux terminal utility for HDDs that completely erases a
