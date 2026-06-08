@@ -51,7 +51,7 @@ trueformat --list
 | `-v`, `--verbose` | Print detailed live output during the operation |
 | `--verify` | After wiping, read back every sector and rewrite any that are not `0x00` |
 | `--remove-delays` | Skip timed pauses (warnings and confirmations are never skipped) |
-| `--disable-safety-locks` | Bypass system-disk protection. **Extremely dangerous.** |
+| `--disable-safety-locks` | Bypass system-disk protection. **Dangerous.** |
 | `--version` | Print version and exit |
 
 Unknown options cause an immediate error and suggest `--help`.
