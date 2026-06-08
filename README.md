@@ -54,8 +54,6 @@ trueformat --list
 | `--disable-safety-locks` | Bypass system-disk protection. **Dangerous.** |
 | `--version` | Print version and exit |
 
-Unknown options cause an immediate error and suggest `--help`.
-
 ---
 
 ## Wipe modes
