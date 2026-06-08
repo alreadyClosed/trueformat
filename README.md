@@ -7,7 +7,7 @@ single selected raw block device by overwriting every logical sector with
 `0x00`, leaving the drive in a blank, reusable state with no partition table,
 no filesystem, and no recoverable user data by normal tools.
 
-> **Operates on whole disks only — never on partitions.**  
+> **Operates on whole disks only, never on partitions.**  
 > Must be run as root.
 
 ---
