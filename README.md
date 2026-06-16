@@ -118,3 +118,9 @@ trueformat /dev/sdb
 ## License
 
 MIT
+
+---
+
+## Note
+
+The current version of this tool only supports HDDs
