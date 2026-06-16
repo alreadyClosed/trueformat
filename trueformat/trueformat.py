@@ -7,6 +7,9 @@ import argparse
 import signal
 import subprocess
 import re
+import threading
+import queue
+import errno
 from pathlib import Path
 
 
@@ -50,12 +53,17 @@ KNOWN_FLAGS = {
     "--disable-safety-locks",
     "--list",
     "--version",
+    "--retry",
+    "--strict",
+    "--no-prescan",
+    "--chunk-size",
 }
 
 def parse_args():
-    for token in sys.argv[1:]:
+    for i, token in enumerate(sys.argv[1:]):
         if token.startswith("-"):
-            if token not in KNOWN_FLAGS:
+            base = token.split("=")[0]
+            if base not in KNOWN_FLAGS:
                 print(red(f"[!] Unknown option: {token}"))
                 print(f"    Run  {bold('trueformat --help')}  for usage information.")
                 sys.exit(2)
@@ -88,6 +96,14 @@ def parse_args():
         help="List available disks and exit.")
     parser.add_argument("--version", action="store_true",
         help="Print version and exit.")
+    parser.add_argument("--retry", type=int, default=1, metavar="N",
+        help="Number of times to retry a bad sector before skipping it. Default: 1.")
+    parser.add_argument("--strict", action="store_true",
+        help="Abort immediately on any bad sector instead of skipping.")
+    parser.add_argument("--no-prescan", action="store_true",
+        help="Skip the bad sector prescan and write directly. Faster on known-good drives.")
+    parser.add_argument("--chunk-size", type=int, default=0, metavar="MiB",
+        help="Write chunk size in MiB. Default: auto-detected from sysfs, fallback 8.")
 
     return parser.parse_args()
 
@@ -114,6 +130,22 @@ def read_sysfs(path):
         return Path(path).read_text().strip()
     except Exception:
         return "unknown"
+
+
+def get_chunk_size(disk_name, lbs, override_mib):
+    if override_mib and override_mib > 0:
+        return override_mib * 1024 * 1024
+
+    try:
+        optimal = int(read_sysfs(f"/sys/block/{disk_name}/queue/optimal_io_size") or 0)
+        if optimal > 0:
+            chunk = max(optimal, 8 * 1024 * 1024)
+            chunk = (chunk // lbs) * lbs
+            return chunk
+    except Exception:
+        pass
+
+    return 8 * 1024 * 1024
 
 
 def list_disks():
@@ -277,7 +309,7 @@ def unmount_disk_partitions(disk, verbose):
         if not parts:
             continue
         src = parts[0]
-        if src == node or src.startswith(node) and not src[len(node):len(node)+1].isalpha():
+        if src == node or (src.startswith(node) and not src[len(node):len(node)+1].isalpha()):
             to_unmount.append(src)
 
     if not to_unmount:
@@ -300,7 +332,7 @@ def unmount_disk_partitions(disk, verbose):
 
 BAR_WIDTH = 22
 
-def render_bar(fraction, speed_bps, eta_secs, done=False):
+def render_bar(label, fraction, speed_bps, eta_secs, done=False):
     filled = int(BAR_WIDTH * fraction)
     bar = "#" * filled + "." * (BAR_WIDTH - filled)
     pct = f"{fraction*100:5.1f}%"
@@ -319,14 +351,81 @@ def render_bar(fraction, speed_bps, eta_secs, done=False):
         m = (int(eta_secs) % 3600) // 60
         eta = f"{h}h{m:02d}m"
 
-    line = f"  [{bar}] {pct} | {spd:>12} | ETA {eta}"
+    line = f"  {label}[{bar}] {pct} | {spd:>12} | ETA {eta}"
     print(f"\r{line}", end="", flush=True)
 
 
-CHUNK_SECTORS = 2048
+def prescan(node, total_size, chunk_bytes, verbose):
+    print(f"  {cyan('>')} Scanning for bad sectors ...")
+    if verbose:
+        print(dim("  [v] Sequential read pass to map bad sectors before writing ..."))
+
+    bad_offsets = set()
+
+    try:
+        fd = os.open(node, os.O_RDONLY)
+    except Exception as e:
+        print(red(f"[!] Could not open {node} for prescan: {e}"))
+        sys.exit(1)
+
+    scanned   = 0
+    t_last    = time.monotonic()
+    t_start   = t_last
+    b_last    = 0
+    speed_bps = 0
+
+    offset = 0
+    while offset < total_size and not interrupted:
+        to_read = min(chunk_bytes, total_size - offset)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            os.read(fd, to_read)
+        except OSError as e:
+            if e.errno in (errno.EIO, errno.EILSEQ):
+                bad_offsets.add(offset)
+                if verbose:
+                    print(f"\n  [v] Bad sector at offset {offset} ({human_size(offset)} into disk)")
+            else:
+                print(red(f"\n[!] Unexpected error during prescan at offset {offset}: {e}"))
+
+        offset  += to_read
+        scanned += to_read
+        b_last  += to_read
+
+        now = time.monotonic()
+        if now - t_last >= 0.25:
+            speed_bps = b_last / (now - t_last)
+            b_last    = 0
+            t_last    = now
+
+        frac = scanned / total_size
+        eta  = (total_size - scanned) / speed_bps if speed_bps > 0 else None
+        render_bar("prescan ", frac, speed_bps, eta)
+
+    os.close(fd)
+    render_bar("prescan ", 1.0, speed_bps, None, done=True)
+    print()
+
+    if bad_offsets:
+        print(yellow(f"  [!] Found {len(bad_offsets)} bad sector(s). They will be skipped during wipe."))
+    else:
+        print(green("  OK  No bad sectors found."))
+
+    return bad_offsets
 
 
-def do_wipe(disk, mode, verbose, verify):
+def buffer_producer(node, total_size, chunk_bytes, buf_queue, stop_event):
+    zero = b"\x00" * chunk_bytes
+    offset = 0
+    while offset < total_size and not stop_event.is_set():
+        to_write = min(chunk_bytes, total_size - offset)
+        buf = zero if to_write == chunk_bytes else b"\x00" * to_write
+        buf_queue.put((offset, buf))
+        offset += to_write
+    buf_queue.put(None)
+
+
+def do_wipe(disk, mode, verbose, verify, retry_count, strict, no_prescan, chunk_size_mib):
     global wipe_started, interrupted
 
     node       = disk["node"]
@@ -335,25 +434,16 @@ def do_wipe(disk, mode, verbose, verify):
     EDGE = 64 * 1024 * 1024
 
     try:
-        fd = os.open(node, os.O_RDWR | os.O_SYNC)
-    except PermissionError:
-        print(red(f"[!] Permission denied opening {node}. Run as root."))
-        sys.exit(1)
-    except Exception as e:
-        print(red(f"[!] Could not open {node}: {e}"))
-        sys.exit(1)
-
-    try:
         lbs_raw = Path(f"/sys/block/{disk['name']}/queue/logical_block_size").read_text().strip()
         lbs = int(lbs_raw)
     except Exception:
         lbs = 512
 
-    chunk_bytes = CHUNK_SECTORS * lbs
-    zero_block  = b"\x00" * chunk_bytes
+    chunk_bytes = get_chunk_size(disk["name"], lbs, chunk_size_mib)
 
-    wipe_started = True
-    print()
+    if verbose:
+        print(dim(f"  [v] Logical block size: {lbs} bytes"))
+        print(dim(f"  [v] Write chunk size: {human_size(chunk_bytes)}"))
 
     if mode == 1:
         ranges = []
@@ -363,36 +453,102 @@ def do_wipe(disk, mode, verbose, verify):
             r2_start = total_size - EDGE
             ranges.append((r2_start, total_size - r2_start))
         wipe_total = sum(r[1] for r in ranges)
+        bad_offsets = set()
     else:
         ranges = [(0, total_size)]
         wipe_total = total_size
 
-    written_total    = 0
-    t_start          = time.monotonic()
-    t_last           = t_start
+        if not no_prescan:
+            bad_offsets = prescan(node, total_size, chunk_bytes, verbose)
+        else:
+            if verbose:
+                print(dim("  [v] Prescan skipped (--no-prescan)."))
+            bad_offsets = set()
+
+    try:
+        fd = os.open(node, os.O_RDWR)
+    except PermissionError:
+        print(red(f"[!] Permission denied opening {node}. Run as root."))
+        sys.exit(1)
+    except Exception as e:
+        print(red(f"[!] Could not open {node}: {e}"))
+        sys.exit(1)
+
+    wipe_started = True
+
+    stop_event = threading.Event()
+    buf_queue  = queue.Queue(maxsize=4)
+
+    producer_thread = threading.Thread(
+        target=buffer_producer,
+        args=(node, wipe_total, chunk_bytes, buf_queue, stop_event),
+        daemon=True,
+    )
+    producer_thread.start()
+
+    skipped_offsets = []
+    written_total   = 0
+    t_start         = time.monotonic()
+    t_last          = t_start
     bytes_since_last = 0
-    speed_bps        = 0
+    speed_bps       = 0
 
-    def write_range(start, length):
-        nonlocal written_total, t_last, bytes_since_last, speed_bps
-        os.lseek(fd, start, os.SEEK_SET)
-        remaining = length
-        offset    = start
+    print()
 
-        while remaining > 0 and not interrupted:
-            to_write = min(chunk_bytes, remaining)
-            buf = zero_block[:to_write]
+    for (range_start, range_length) in ranges:
+        offset    = range_start
+        range_end = range_start + range_length
 
-            if verbose and (written_total % (128 * chunk_bytes) == 0):
-                sector_start = offset // lbs
-                sector_end   = (offset + to_write) // lbs
-                print(f"\n  [v] Writing sectors {sector_start}-{sector_end} ({human_size(to_write)})")
+        while offset < range_end and not interrupted:
+            item = buf_queue.get()
+            if item is None:
+                break
+            _, buf = item
+            to_write = len(buf)
 
-            n = os.write(fd, buf)
-            offset           += n
-            remaining        -= n
-            written_total    += n
-            bytes_since_last += n
+            if offset in bad_offsets:
+                if verbose:
+                    print(f"\n  [v] Skipping known bad sector at offset {offset}")
+                skipped_offsets.append(offset)
+                offset        += to_write
+                written_total += to_write
+            else:
+                success  = False
+                attempts = 0
+                last_err = None
+
+                while attempts <= retry_count and not interrupted:
+                    try:
+                        os.lseek(fd, offset, os.SEEK_SET)
+                        n = os.write(fd, buf)
+                        written_total    += n
+                        bytes_since_last += n
+                        offset           += n
+                        success = True
+                        break
+                    except OSError as e:
+                        last_err = e
+                        attempts += 1
+                        if attempts <= retry_count:
+                            if verbose:
+                                print(f"\n  [v] Write error at offset {offset}, retry {attempts}/{retry_count} ...")
+                            time.sleep(0.5)
+
+                if not success:
+                    if strict:
+                        stop_event.set()
+                        os.close(fd)
+                        print()
+                        print(red(f"[!] Bad sector at offset {offset} ({human_size(offset)} into disk)."))
+                        print(red(f"    Error: {last_err}"))
+                        print(red("    Aborting (--strict mode). Disk is in an incomplete state."))
+                        sys.exit(1)
+                    else:
+                        skipped_offsets.append(offset)
+                        if verbose:
+                            print(f"\n  [v] Skipping unwritable sector at offset {offset} after {retry_count} retries.")
+                        written_total += to_write
+                        offset        += to_write
 
             now     = time.monotonic()
             elapsed = now - t_last
@@ -403,15 +559,15 @@ def do_wipe(disk, mode, verbose, verify):
 
             frac = written_total / wipe_total if wipe_total else 1
             eta  = (wipe_total - written_total) / speed_bps if speed_bps > 0 and frac < 1 else None
-            render_bar(frac, speed_bps, eta)
+            render_bar("wipe    ", frac, speed_bps, eta)
 
-    for (start, length) in ranges:
-        write_range(start, length)
         if interrupted:
             break
 
+    stop_event.set()
+
     if not interrupted:
-        render_bar(1.0, speed_bps, None, done=True)
+        render_bar("wipe    ", 1.0, speed_bps, None, done=True)
         print()
 
         if verbose:
@@ -425,6 +581,14 @@ def do_wipe(disk, mode, verbose, verify):
 
     os.close(fd)
 
+    if skipped_offsets:
+        print()
+        print(yellow(f"  [!] {len(skipped_offsets)} sector(s) were skipped due to read/write errors:"))
+        for off in skipped_offsets[:10]:
+            print(yellow(f"      offset {off} ({human_size(off)} into disk)"))
+        if len(skipped_offsets) > 10:
+            print(yellow(f"      ... and {len(skipped_offsets) - 10} more."))
+
     if verify and not interrupted:
         print()
         print(f"  {cyan('>')} Verification pass ...")
@@ -437,19 +601,24 @@ def do_wipe(disk, mode, verbose, verify):
             print(red(f"[!] Could not open {node} for verification: {e}"))
             return
 
-        bad_sectors = []
-        read_total  = 0
-        t_vlast     = time.monotonic()
-        vbytes_last = 0
-        vspeed      = 0
+        needs_rewrite = []
+        read_total    = 0
+        t_vlast       = time.monotonic()
+        vbytes_last   = 0
+        vspeed        = 0
 
         for chunk_start in range(0, total_size, chunk_bytes):
+            if chunk_start in skipped_offsets:
+                read_total += min(chunk_bytes, total_size - chunk_start)
+                continue
             to_read = min(chunk_bytes, total_size - chunk_start)
-            os.lseek(fd_r, chunk_start, os.SEEK_SET)
-            data = os.read(fd_r, to_read)
-
-            if any(b != 0 for b in data):
-                bad_sectors.append(chunk_start)
+            try:
+                os.lseek(fd_r, chunk_start, os.SEEK_SET)
+                data = os.read(fd_r, to_read)
+                if any(b != 0 for b in data):
+                    needs_rewrite.append(chunk_start)
+            except OSError:
+                pass
 
             read_total  += to_read
             vbytes_last += to_read
@@ -461,29 +630,34 @@ def do_wipe(disk, mode, verbose, verify):
 
             frac = read_total / total_size
             eta  = (total_size - read_total) / vspeed if vspeed > 0 else None
-            render_bar(frac, vspeed, eta)
+            render_bar("verify  ", frac, vspeed, eta)
 
         os.close(fd_r)
         print()
 
-        if bad_sectors:
-            print(yellow(f"  [!] Found {len(bad_sectors)} non-zero chunk(s). Rewriting ..."))
-            fd_w = os.open(node, os.O_RDWR | os.O_SYNC)
-            for bs in bad_sectors:
+        if needs_rewrite:
+            print(yellow(f"  [!] Found {len(needs_rewrite)} non-zero chunk(s). Rewriting ..."))
+            fd_w = os.open(node, os.O_RDWR)
+            for bs in needs_rewrite:
                 to_write = min(chunk_bytes, total_size - bs)
-                os.lseek(fd_w, bs, os.SEEK_SET)
-                os.write(fd_w, b"\x00" * to_write)
-                if verbose:
-                    print(dim(f"  [v] Rewrote chunk at offset {bs} ({human_size(bs)} into disk)"))
+                try:
+                    os.lseek(fd_w, bs, os.SEEK_SET)
+                    os.write(fd_w, b"\x00" * to_write)
+                    if verbose:
+                        print(dim(f"  [v] Rewrote chunk at offset {bs}"))
+                except OSError as e:
+                    print(yellow(f"  [!] Could not rewrite at offset {bs}: {e}"))
             os.close(fd_w)
-            print(green("  OK  Rewrite complete. Disk is fully zeroed."))
+            print(green("  OK  Rewrite complete."))
         else:
             if verbose:
-                print(dim("  [v] Verification complete. All sectors confirmed 0x00."))
-            print(green("  OK  Verification passed. All sectors are 0x00."))
+                print(dim("  [v] Verification complete. All readable sectors confirmed 0x00."))
+            print(green("  OK  Verification passed. All readable sectors are 0x00."))
+
+    return skipped_offsets
 
 
-def print_final_report(disk, mode, verify, interrupted_flag):
+def print_final_report(disk, mode, verify, interrupted_flag, skipped):
     node = disk["node"]
     print()
     print("-" * 60)
@@ -495,6 +669,8 @@ def print_final_report(disk, mode, verify, interrupted_flag):
     print(f"  Size            : {disk['size']}")
     print(f"  Wipe mode       : {mode} - {MODE_INFO[mode]['label']}")
     print(f"  Verify pass     : {'yes' if verify else 'no'}")
+    if skipped:
+        print(f"  Skipped sectors : {len(skipped)}")
     print()
     if interrupted_flag:
         print(red("  Result          : INCOMPLETE - wipe was interrupted"))
@@ -504,7 +680,10 @@ def print_final_report(disk, mode, verify, interrupted_flag):
     else:
         print(green("  Partition table : none"))
         print(green("  Filesystem      : none"))
-        print(green("  Data            : zeroed (all user-addressable sectors)"))
+        if skipped:
+            print(yellow(f"  Data            : zeroed with {len(skipped)} unwritable sector(s) skipped"))
+        else:
+            print(green("  Data            : zeroed (all user-addressable sectors)"))
         print(green("  Allocation      : undefined - raw unformatted storage"))
         print(green("  Status          : ready for repartitioning and formatting"))
     print("-" * 60)
@@ -516,8 +695,12 @@ def main():
 
     args = parse_args()
 
+    if args.retry < 0 or args.retry > 10:
+        print(red("[!] --retry must be between 0 and 10."))
+        sys.exit(2)
+
     if args.version:
-        print("trueformat 1.0.0")
+        print("trueformat 1.1.0")
         sys.exit(0)
 
     if args.help:
@@ -539,6 +722,14 @@ def main():
                          are never skipped)
   --disable-safety-locks Bypass system-disk protection. Requires an
                          additional explicit confirmation. DANGEROUS.
+  --retry N              Retry a bad sector N times before skipping (0-10).
+                         Default: 1.
+  --strict               Abort immediately on any bad sector instead of
+                         skipping. Overrides --retry.
+  --no-prescan           Skip the bad sector scan before writing. Faster on
+                         drives known to be healthy.
+  --chunk-size MiB       Write chunk size in MiB. Default: auto from sysfs,
+                         fallback 8.
   --version              Print version and exit
 
 {bold('WIPE MODES')}
@@ -546,10 +737,19 @@ def main():
   2  Deeper Cleanup - single full pass, no verification (not guaranteed)
   3  Full Wipe      - complete sequential overwrite of all sectors (recommended)
 
+{bold('DEFAULT BEHAVIOR')}
+  By default trueformat prescans the disk for bad sectors before writing,
+  retries each bad sector once, and skips any that still fail. Skipped
+  sectors are reported at the end. Use --strict to abort on the first
+  bad sector instead.
+
 {bold('EXAMPLES')}
   trueformat --list
   trueformat /dev/sdb
   trueformat /dev/sdb --verify -v
+  trueformat /dev/sdb --retry 3
+  trueformat /dev/sdb --strict
+  trueformat /dev/sdb --no-prescan
   trueformat /dev/sdb --remove-delays
   trueformat /dev/sdb --disable-safety-locks
 """)
@@ -659,9 +859,12 @@ def main():
     unmount_disk_partitions(disk, args.verbose)
 
     print(f"  {cyan('>')} Starting wipe  [Mode {mode}]")
-    do_wipe(disk, mode, args.verbose, args.verify)
+    skipped = do_wipe(
+        disk, mode, args.verbose, args.verify,
+        args.retry, args.strict, args.no_prescan, args.chunk_size
+    )
 
-    print_final_report(disk, mode, args.verify, interrupted)
+    print_final_report(disk, mode, args.verify, interrupted, skipped or [])
 
 
 if __name__ == "__main__":
