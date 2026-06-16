@@ -1,4 +1,3 @@
-## ⚠️ TOOL IS STILL IN TESTING PHASE
 
 # trueformat
 
